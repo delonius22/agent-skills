@@ -1,0 +1,527 @@
+[project]
+name = "tally"
+package = "tally"
+language = "python"
+python = "3.14"
+cli = "tally"
+description = "Split a month of shared expenses into the fewest practical transfers."
+problem = """Roommates log shared expenses in a spreadsheet, but at month end nobody
+can tell who owes whom. The arithmetic is error-prone, cents go missing, and settling
+up takes many small transfers. Solved means: one command reads the month's CSV and
+prints a short, exact list of who pays whom."""
+problem_short = """Households cannot tell who owes whom from a month of shared
+expenses, and settling by hand loses cents and takes many transfers."""
+toolchain_note = "Python 3.14 (latest stable with bugfix status; 3.15 not yet released)."
+spec_id_scheme = "Derived: S + the SPECS.md clause number (clause 2.2 is S2.2). PRD IDs are verbatim (G1, I1, N1)."
+dependencies = []
+assumptions = ["The `date` column is carried through but never validated or used, because no clause gives it a format or a purpose."]
+
+[[capabilities]]
+id = "C1"
+name = "Clear failure"
+need = "every rejected input is reported with its line and reason, and internal faults are told apart from bad input"
+
+[[capabilities]]
+id = "C2"
+name = "Exact money"
+need = "amounts are parsed, split, and printed with no cent created or lost"
+
+[[capabilities]]
+id = "C3"
+name = "Intake"
+need = "each CSV row becomes one trusted expense or a precise rejection"
+
+[[capabilities]]
+id = "C4"
+name = "Balances"
+need = "each person's net position is known and the positions sum to zero"
+
+[[capabilities]]
+id = "C5"
+name = "Settlement plan"
+need = "the balances become a short, deterministic list of transfers"
+
+[[capabilities]]
+id = "C6"
+name = "Answer"
+need = "one command turns a file into printed transfers and a meaningful exit code"
+
+[[specs]]
+id = "S1.1"
+summary = "Input is UTF-8 CSV with header date,payer,amount,participants."
+traces = ["G1"]
+[[specs]]
+id = "S1.2"
+summary = "Amount: decimal string, at most 2 fractional digits, > 0, <= 100000.00."
+traces = ["G3", "I2"]
+[[specs]]
+id = "S1.3"
+summary = "Participants: ';'-separated names; payer may or may not be included."
+traces = ["G1"]
+[[specs]]
+id = "S1.4"
+summary = "Names: case-sensitive, 1-40 characters, no ';' or ','."
+traces = ["G1"]
+[[specs]]
+id = "S2.1"
+summary = "All money is integer cents."
+traces = ["I2"]
+[[specs]]
+id = "S2.2"
+summary = "Leftover cents go one each to participants in alphabetical order."
+traces = ["G3"]
+[[specs]]
+id = "S3.1"
+summary = "Balance = paid minus share of each expense participated in."
+traces = ["G1"]
+[[specs]]
+id = "S3.2"
+summary = "Balances must sum to zero, else fail 'internal: balances do not sum to zero'."
+traces = ["I1"]
+[[specs]]
+id = "S4.1"
+summary = "Match largest debtor with largest creditor, transfer the smaller amount, repeat."
+traces = ["G2"]
+[[specs]]
+id = "S4.2"
+summary = "Ties broken by name, alphabetically."
+traces = ["G2"]
+[[specs]]
+id = "S5.1"
+summary = "`tally settle FILE` prints '<from> pays <to> <amount>' with amount as 12.34."
+traces = ["G1"]
+[[specs]]
+id = "S5.2"
+summary = "Exit 0 ok, 2 invalid input ('error: line <n>: <reason>' on stderr), 1 internal."
+traces = ["G1"]
+[[specs]]
+id = "S5.3"
+summary = "Currency conversion is not supported."
+traces = ["N1"]
+out_of_scope = "PRD non-goal N1 (multiple currencies)"
+
+[[questions]]
+id = "OQ-1"
+text = "S1.2 caps one amount at 100000.00 but nothing caps a person's monthly total; decide whether totals need a limit"
+cites = ["S1.2", "S3.1"]
+
+# ---------------------------------------------------------------- step 1
+[[modules]]
+path = "tally/errors.py"
+capability = ["C1"]
+summary = "Define the error types every other module raises."
+owns = """Every later piece either rejects input or detects a broken invariant, and the
+CLI must map each kind to its exit code (S5.2). This file owns those categories and
+contains no logic."""
+why_now = """Nothing must exist before a failure can be named, and almost every later
+module raises one of these."""
+
+[[modules.items]]
+name = "TallyError"
+signature = "class TallyError(Exception)"
+order_note = "the base the CLI catches"
+summary = "Base class for every error Tally raises on purpose."
+piece = "C1 Clear failure: one root, so the CLI can tell deliberate failures from bugs."
+why = """The CLI must exit 1 or 2 for known failures and still crash loudly on
+genuine bugs. A common base is what lets it catch exactly the failures the program
+meant to raise."""
+what = "An exception type with no extra fields. Never raised directly."
+spec = ["S5.2"]
+
+[[modules.items]]
+name = "InvalidInputError"
+signature = "class InvalidInputError(TallyError)"
+order_note = "the user's mistakes, which carry a line number"
+summary = "Raised when one input row breaks a format rule."
+piece = "C1 Clear failure for bad input: the reason and the exact row."
+why = """A household fixing its spreadsheet needs the row number and the rule it
+broke; a bare 'invalid input' sends them hunting through every line."""
+what = """Carries the 1-based CSV line number and a short reason. Its message must
+read exactly 'line <n>: <reason>', so the CLI only prefixes 'error: ' (S5.2)."""
+spec = ["S5.2"]
+attributes = { line = "1-based line number in the CSV file, header is line 1", reason = "short human-readable rule that was broken" }
+body = ["line: int", "reason: str"]
+
+[[modules.items.methods]]
+name = "__init__"
+signature = "def __init__(self, line: int, reason: str) -> None"
+summary = "Store the line and reason and build the message."
+piece = "C1 Clear failure: the message format the CLI prints."
+why = "The format is fixed by S5.2, so it is built once here instead of in every caller."
+what = "Sets line and reason; the exception message becomes 'line <n>: <reason>'."
+spec = ["S5.2"]
+args = { line = "1-based CSV line number", reason = "the broken rule" }
+
+[[modules.items.methods.steps]]
+task = "Keep both values and make the exception's message read 'line <n>: <reason>'"
+outcome = "str(InvalidInputError(3, 'bad amount')) == 'line 3: bad amount'"
+test = "message_format"
+
+[[modules.items]]
+name = "InternalError"
+signature = "class InternalError(TallyError)"
+order_note = "broken invariants, which are never the user's fault"
+summary = "Raised when Tally's own arithmetic breaks an invariant."
+piece = "C1 Clear failure for internal faults, kept apart from bad input."
+why = """If balances fail to sum to zero, the bug is in Tally, not the file. Reporting
+it as bad input would send the user to fix a spreadsheet that is fine."""
+what = "An exception whose message is the reason, e.g. 'internal: balances do not sum to zero'."
+spec = ["S3.2", "S5.2"]
+
+# ---------------------------------------------------------------- step 2
+[[modules]]
+path = "tally/models.py"
+capability = ["C3", "C5"]
+summary = "Define the Expense and Transfer records the rest of the system passes around."
+owns = """It fixes the shape of one trusted expense and one planned transfer. It
+does not parse, validate, or compute anything."""
+why_now = """Parsing, splitting, and settling are all defined in terms of these
+shapes, so they must be fixed before any of that logic."""
+root_reason = "the data contracts come right after the error vocabulary and before any logic"
+stdlib = ["from dataclasses import dataclass"]
+
+[[modules.items]]
+name = "Expense"
+signature = "class Expense"
+decorators = ["@dataclass(frozen=True, slots=True)"]
+order_note = "what one CSV row becomes"
+summary = "One validated expense row."
+piece = "C3 Intake: the trusted form of a CSV row."
+why = """Every later step assumes the row is already valid. Freezing that promise in
+one immutable type means no later step re-checks it, and none can corrupt it."""
+what = "The row's line, date text, payer, amount in integer cents, and participants."
+spec = ["S1.1", "S1.3", "S2.1"]
+attributes = { line = "1-based CSV line it came from", date = "date text exactly as given (unused, see Assumptions)", payer = "who paid", amount_cents = "positive amount in cents", participants = "names sharing the cost, in file order" }
+body = ["line: int", "date: str", "payer: str", "amount_cents: int", "participants: tuple[str, ...]"]
+
+[[modules.items]]
+name = "Transfer"
+signature = "class Transfer"
+decorators = ["@dataclass(frozen=True, slots=True)"]
+order_note = "what the settlement produces"
+summary = "One payment from a debtor to a creditor."
+piece = "C5 Settlement plan: one line of the answer."
+why = "The plan and the printed output are both lists of these, so they share one shape."
+what = "Who pays, who receives, and the amount in positive integer cents."
+spec = ["S4.1", "S5.1"]
+attributes = { payer = "the person paying", payee = "the person receiving", cents = "positive amount in cents" }
+body = ["payer: str", "payee: str", "cents: int"]
+
+# ---------------------------------------------------------------- step 3
+[[modules]]
+path = "tally/money.py"
+capability = ["C2"]
+summary = "Parse, split, and format money as integer cents."
+owns = """It is the only place that converts between text and cents or divides an
+amount. It knows nothing about CSV rows or people's balances."""
+why_now = """Intake (step 4) parses amounts and balances (step 5) split them; both
+are only correct if this file is."""
+stdlib = ["from typing import Final"]
+uses = [{ module = "tally.errors", symbols = "InvalidInputError", why = "raised for amounts that break S1.2" }]
+
+[[modules.items]]
+kind = "const"
+name = "MAX_CENTS"
+line = "MAX_CENTS: Final[int] = 10_000_000"
+comment = "S1.2: 100000.00"
+
+[[modules.items]]
+name = "parse_cents"
+signature = "def parse_cents(text: str, line: int) -> int"
+order_note = "text to cents; everything else starts from a parsed amount"
+summary = "Convert an amount string to integer cents."
+piece = "C2 Exact money at the boundary: text in, cents out."
+why = """Floats cannot represent most cent values exactly (I2), so one stray
+float conversion would let cents drift. Parsing straight to an integer is what makes
+'never lose a cent' (G3) possible at all."""
+what = "Accepts a decimal string; returns cents; refuses anything S1.2 forbids."
+spec = ["S1.2", "S2.1"]
+traces = ["I2"]
+args = { text = "amount exactly as in the CSV", line = "row number, for the error" }
+returns = "The amount in cents, between 1 and MAX_CENTS"
+raises = { InvalidInputError = "for malformed, zero, negative, or too-large amounts" }
+
+[[modules.items.steps]]
+task = "Accept only digits with an optional point and at most two fractional digits (S1.2)"
+think = "Which inputs look numeric but must still be refused, such as '1e3', '.5', or ' 12'?"
+outcome = "'12', '12.5' and '12.50' parse; '1e3', '12.345' and '' raise InvalidInputError"
+test = "rejects_bad_format"
+
+[[modules.items.steps]]
+task = "Turn the accepted text into whole cents without ever using a float, then enforce 0 < cents <= MAX_CENTS"
+outcome = "parse_cents('12.5', 2) == 1250, and '0', '0.00' and '100000.01' raise InvalidInputError"
+test = "range_and_value"
+
+[[modules.items]]
+name = "format_cents"
+signature = "def format_cents(cents: int) -> str"
+order_note = "cents to text; the inverse, needed only by the CLI"
+summary = "Format cents as a two-decimal string."
+piece = "C2 Exact money at the output boundary."
+why = "S5.1 fixes the printed form, so one function owns it."
+what = "Returns e.g. '12.34' for 1234 and '0.05' for 5."
+spec = ["S5.1"]
+
+[[modules.items.steps]]
+task = "Render whole units, a point, and exactly two digits of cents"
+outcome = "format_cents(5) == '0.05' and format_cents(123400) == '1234.00'"
+test = "two_decimals"
+
+[[modules.items]]
+name = "split_cents"
+signature = "def split_cents(total: int, names: list[str]) -> dict[str, int]"
+order_note = "the division rule that decides who absorbs leftover cents"
+summary = "Split an amount among names with no cent lost."
+piece = "C2 Exact money when dividing: the leftover-cent rule of S2.2."
+why = """1000 cents among 3 people cannot be split evenly; rounding each share loses
+or invents a cent, and the balances then fail to sum to zero (I1). A fixed rule for
+who absorbs the remainder keeps the sum exact and makes every run reproducible."""
+what = """Returns each name's share. The shares sum to total exactly, and differ by at
+most one cent."""
+spec = ["S2.2"]
+traces = ["G3", "I1"]
+args = { total = "amount in cents, > 0", names = "distinct participant names, any order" }
+returns = "Mapping from each name to its share in cents"
+
+[[modules.items.steps]]
+task = "Give every name the same whole-cent base share"
+think = "What is left over, and can it ever be as large as the number of names?"
+outcome = "split_cents(900, ['a', 'b', 'c']) gives 300 each"
+test = "even_split"
+
+[[modules.items.steps]]
+task = "Hand the leftover cents out one each, in alphabetical order of name (S2.2)"
+think = "Why must the order come from the names rather than from the input list?"
+outcome = "split_cents(1000, ['c', 'a', 'b']) gives a=334, b=333, c=333, summing to 1000"
+test = "remainder_alphabetical"
+
+# ---------------------------------------------------------------- step 4
+[[modules]]
+path = "tally/loader.py"
+capability = ["C3"]
+summary = "Read the expense CSV into validated Expense records."
+owns = """It owns every S1 format rule. It does not split money or compute
+balances."""
+why_now = """The record shape (step 2) and amount parsing (step 3) exist, so a row
+can now be turned into a trusted Expense."""
+stdlib = ["import csv", "from pathlib import Path", "from typing import Final"]
+uses = [
+  { module = "tally.errors", symbols = "InvalidInputError", why = "raised for every rejected row" },
+  { module = "tally.models", symbols = "Expense", why = "the type each row becomes" },
+  { module = "tally.money", symbols = "parse_cents", why = "converts the amount column" },
+]
+
+[[modules.items]]
+kind = "const"
+name = "HEADER"
+line = 'HEADER: Final[tuple[str, ...]] = ("date", "payer", "amount", "participants")'
+comment = "S1.1"
+
+[[modules.items]]
+kind = "const"
+name = "MAX_NAME_CHARS"
+line = "MAX_NAME_CHARS: Final[int] = 40"
+comment = "S1.4"
+
+[[modules.items]]
+name = "check_name"
+signature = "def check_name(name: str, line: int) -> str"
+order_note = "the smallest rule, reused for payer and participants"
+summary = "Return a name unchanged if it obeys S1.4."
+piece = "C3 Intake: the name rule, applied the same way everywhere."
+why = "Payer and participants follow one rule; checking it in one place stops the two drifting apart."
+what = "Returns the name, or refuses an empty, too-long, or ';'/','-containing name."
+spec = ["S1.4"]
+
+[[modules.items.steps]]
+task = "Refuse names outside 1 to MAX_NAME_CHARS characters or containing ';' or ','. Names are case-sensitive and are not trimmed"
+outcome = "check_name('Ana', 2) == 'Ana'; '', a 41-character name and 'a;b' raise InvalidInputError"
+test = "rules"
+
+[[modules.items]]
+name = "parse_row"
+signature = "def parse_row(row: dict[str, str], line: int) -> Expense"
+order_note = "one row; uses check_name and parse_cents"
+summary = "Turn one CSV row into an Expense."
+piece = "C3 Intake for a single row."
+why = """Rejecting a row as early as possible, with its line number, is what makes the
+error message useful (C1). Doing it per row keeps the file loop free of rules."""
+what = "Builds an Expense from the four columns, or refuses the row."
+spec = ["S1.2", "S1.3", "S1.4"]
+args = { row = "column name to raw text", line = "1-based CSV line" }
+returns = "The validated Expense"
+raises = { InvalidInputError = "for any rule the row breaks" }
+
+[[modules.items.steps]]
+task = "Split participants on ';' and check every name and the payer with check_name. An empty list is refused"
+think = "What should happen when the same participant appears twice in one row?"
+outcome = "'Ana;Ben' yields ('Ana', 'Ben'); an empty participants cell raises InvalidInputError"
+test = "participants"
+
+[[modules.items.steps]]
+open = "OQ-1"
+task = "whether a repeated participant in one row is an error, is merged, or pays two shares"
+
+[[modules.items.steps]]
+task = "Parse the amount with parse_cents and return the Expense"
+outcome = "A valid row returns an Expense whose amount_cents equals the parsed amount"
+test = "builds_expense"
+
+[[modules.items]]
+name = "load_expenses"
+signature = "def load_expenses(path: Path) -> list[Expense]"
+order_note = "the public entry; reads the whole file"
+summary = "Read every expense from a CSV file."
+piece = "C3 Intake for the whole file: header check, then each row."
+why = """A wrong header means every column is misread, so checking it first prevents a
+cascade of misleading row errors. Reading the whole file before computing anything
+also guarantees no partial answer is ever printed for a broken file."""
+what = "Returns all rows as Expenses in file order, or refuses the first bad row."
+spec = ["S1.1"]
+args = { path = "the CSV file" }
+returns = "Every expense, in file order"
+raises = { InvalidInputError = "for a wrong header (line 1) or the first bad row" }
+
+[[modules.items.steps]]
+task = "Open the file as UTF-8 and require the header to equal HEADER exactly (S1.1)"
+outcome = "A file with header 'payer,amount' raises InvalidInputError for line 1"
+test = "header"
+
+[[modules.items.steps]]
+task = "Parse every data row with parse_row, numbering lines so the header is line 1"
+think = "Why does the line number matter more here than anywhere else?"
+outcome = "A bad amount on the third physical line raises InvalidInputError with line == 3"
+test = "line_numbers"
+
+[[modules.items.steps]]
+task = "Return the expenses in file order"
+outcome = "A two-row file returns two Expenses in the same order"
+test = "order"
+
+# ---------------------------------------------------------------- step 5
+[[modules]]
+path = "tally/balances.py"
+capability = ["C4"]
+summary = "Compute each person's balance from the expenses."
+owns = "It owns S3: the balance rule and the zero-sum check. It does not decide who pays whom."
+why_now = """Expenses (step 4) and exact splitting (step 3) exist. Settlement (step 6)
+needs balances as its input."""
+uses = [
+  { module = "tally.errors", symbols = "InternalError", why = "raised when balances fail to sum to zero" },
+  { module = "tally.models", symbols = "Expense", why = "the input" },
+  { module = "tally.money", symbols = "split_cents", why = "computes each participant's share" },
+]
+
+[[modules.items]]
+name = "compute_balances"
+signature = "def compute_balances(expenses: list[Expense]) -> dict[str, int]"
+summary = "Return each person's net balance in cents."
+piece = "C4 Balances: who is owed and who owes, before any transfer is planned."
+why = """Settlement only needs one number per person, so collapsing many expenses
+into net positions is what makes a short plan possible (G2). The zero-sum check (I1)
+is the system's one end-to-end proof that no cent was lost; skipping it would let a
+splitting bug print a plausible but wrong plan."""
+what = """Positive means the person is owed money, negative means they owe. Includes
+everyone who paid or participated. The values always sum to zero."""
+spec = ["S3.1", "S3.2"]
+traces = ["I1", "G3"]
+args = { expenses = "validated expenses, any order" }
+returns = "Mapping from name to balance in cents"
+raises = { InternalError = "with message 'internal: balances do not sum to zero'" }
+
+[[modules.items.steps]]
+task = "Credit each payer with the full amount and debit each participant their share from split_cents (S3.1)"
+think = "A payer who is also a participant is both credited and debited; is that right?"
+outcome = "Ana pays 30.00 for Ana;Ben gives Ana +1500 and Ben -1500"
+test = "payer_participant"
+
+[[modules.items.steps]]
+task = "Verify the balances sum to zero; if not, raise InternalError('internal: balances do not sum to zero') (S3.2)"
+outcome = "A deliberately corrupted total raises InternalError with that exact message"
+test = "zero_sum"
+
+# ---------------------------------------------------------------- step 6
+[[modules]]
+path = "tally/settle.py"
+capability = ["C5"]
+summary = "Turn balances into a list of transfers."
+owns = "It owns S4: the matching rule and its tie-break. It does not read or print anything."
+why_now = "Balances (step 5) exist; the CLI (step 7) prints what this returns."
+uses = [{ module = "tally.models", symbols = "Transfer", why = "the type of each planned payment" }]
+
+[[modules.items]]
+name = "settle"
+signature = "def settle(balances: dict[str, int]) -> list[Transfer]"
+summary = "Plan the transfers that bring every balance to zero."
+piece = "C5 Settlement plan: few transfers, always the same ones for the same input."
+why = """Paying back expense by expense takes as many transfers as there are expenses.
+Matching the largest debtor with the largest creditor clears at least one person per
+transfer, so a household of n people needs at most n - 1 (G2). A fixed tie-break
+makes the plan reproducible, so two roommates running it get the same answer."""
+what = "Returns transfers in the order they are planned; applying all of them zeroes every balance."
+spec = ["S4.1", "S4.2"]
+traces = ["G2"]
+args = { balances = "name to cents; must sum to zero" }
+returns = "The planned transfers, each with a positive amount"
+
+[[modules.items.steps]]
+task = "Repeatedly pick the largest debtor and the largest creditor, breaking ties alphabetically by name (S4.2)"
+think = "When two people owe the same amount, which one is 'largest', and why does it matter?"
+outcome = "With A=-500, B=-500, C=+1000 the first transfer is from A"
+test = "tie_break"
+
+[[modules.items.steps]]
+task = "Transfer the smaller of the two amounts, update both, and stop when every balance is zero (S4.1)"
+outcome = "For {A: -700, B: 300, C: 400} the plan is A pays C 400, then A pays B 300"
+test = "plan"
+
+# ---------------------------------------------------------------- step 7
+[[modules]]
+path = "tally/__main__.py"
+capability = ["C6"]
+summary = "Run `tally settle FILE` and map failures to exit codes."
+owns = "It owns S5: arguments, output lines, and exit codes. It holds no business rules."
+why_now = "Every capability below it exists; this is the step that makes them usable."
+main_guard = true
+stdlib = ["import argparse", "import sys", "from pathlib import Path"]
+uses = [
+  { module = "tally.balances", symbols = "compute_balances", why = "computes the balances" },
+  { module = "tally.errors", symbols = "InternalError, InvalidInputError", why = "mapped to exit codes 1 and 2" },
+  { module = "tally.loader", symbols = "load_expenses", why = "reads the file" },
+  { module = "tally.money", symbols = "format_cents", why = "prints amounts" },
+  { module = "tally.settle", symbols = "settle", why = "plans the transfers" },
+]
+
+[[modules.steps]]
+task = "Keep the module-level guard that calls main() and exits with its return value"
+outcome = "`python -m tally settle FILE` behaves exactly like the `tally` script"
+
+[[modules.items]]
+name = "main"
+signature = "def main(argv: list[str] | None = None) -> int"
+summary = "Parse arguments, run the pipeline, and return the exit code."
+piece = "C6 Answer: the only place the user meets the system."
+why = """Users judge the tool by its output and exit code; scripts that call it depend
+on 2 meaning 'fix your file' and 1 meaning 'report a bug'. Keeping that mapping here
+leaves every other module free of printing and exiting."""
+what = """Runs load, balance, settle, and prints one line per transfer. Returns 0, 2 for
+invalid input, 1 for internal errors (S5.2)."""
+spec = ["S5.1", "S5.2"]
+args = { argv = "arguments without the program name; None means sys.argv[1:]" }
+returns = "The process exit code"
+
+[[modules.items.steps]]
+task = "Accept exactly the `settle FILE` command"
+outcome = "`tally settle x.csv` runs; `tally` with no command exits non-zero with usage text"
+test = "arguments"
+
+[[modules.items.steps]]
+task = "Print each transfer as '<from> pays <to> <amount>' using format_cents (S5.1)"
+outcome = "A one-transfer plan prints exactly 'Ben pays Ana 15.00'"
+test = "output_line"
+
+[[modules.items.steps]]
+task = "Map InvalidInputError to 'error: <message>' on stderr and exit 2, and InternalError to exit 1 (S5.2)"
+think = "Why catch the two error types separately instead of their shared base?"
+outcome = "A bad amount on line 3 prints 'error: line 3: ...' to stderr and returns 2"
+test = "exit_codes"
